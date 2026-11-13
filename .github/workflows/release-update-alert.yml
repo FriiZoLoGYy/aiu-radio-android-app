@@ -1,0 +1,200 @@
+name: Android update alerts
+run-name: ${{ github.event_name == 'workflow_dispatch' && 'Validate Firebase without delivery' || 'Send Android update alert' }}
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  update-alert:
+    name: Validate release and notify
+    if: >-
+      github.repository == 'FriiZoLoGYy/aiu-radio-android-app' &&
+      ((github.event_name == 'workflow_dispatch' &&
+        github.ref_name == github.event.repository.default_branch) ||
+       (github.event_name == 'release' &&
+        !github.event.release.draft && !github.event.release.prerelease))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    concurrency:
+      group: aiu-radio-update-alert-${{ github.event_name }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Verify the published release and APK
+        id: release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          import tempfile
+          from pathlib import Path
+          from urllib.parse import quote
+          from urllib.request import Request, urlopen
+
+          repository = "FriiZoLoGYy/aiu-radio-android-app"
+          request = Request(
+              f"https://api.github.com/repos/{repository}/releases/latest",
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {os.environ.pop('GH_TOKEN')}",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          with urlopen(request, timeout=20) as response:
+              release = json.load(response)
+
+          if release["draft"] or release["prerelease"] or not release["published_at"]:
+              raise SystemExit("GitHub must have a published stable release.")
+          event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
+          if event["release"]["id"] != release["id"]:
+              raise SystemExit("Only the release marked latest in GitHub can trigger an alert.")
+
+          def download_asset(name, max_size):
+              assets = [
+                  asset for asset in release["assets"]
+                  if asset["name"] == name and asset["state"] == "uploaded"
+              ]
+              if len(assets) != 1:
+                  raise SystemExit(f"Attach one {name} asset to the release before publishing.")
+              asset = assets[0]
+              size = asset["size"]
+              tag = quote(release["tag_name"], safe="")
+              url = f"https://github.com/{repository}/releases/download/{tag}/{quote(name, safe='')}"
+              if asset["browser_download_url"] != url or not 1 <= size <= max_size:
+                  raise SystemExit(f"The release asset {name} has an invalid URL or size.")
+              with urlopen(url, timeout=60) as response:
+                  content = response.read(size + 1)
+              if len(content) != size:
+                  raise SystemExit(f"The downloaded size of {name} differs from GitHub's asset size.")
+              return content
+
+          version = json.loads(download_asset("version.json", 8192))
+          if not isinstance(version, dict):
+              raise SystemExit("version.json must contain a JSON object.")
+          version_code = version.get("versionCode")
+          version_name = version.get("versionName")
+          apk_name = version.get("apkName")
+          sha256 = version.get("sha256")
+          if type(version_code) is not int or not 1 <= version_code <= 2147483647:
+              raise SystemExit("version.json must contain a positive integer Android versionCode.")
+          if not isinstance(version_name, str) or not version_name.strip() or len(version_name) > 64:
+              raise SystemExit("version.json must contain a valid Android versionName.")
+          if not isinstance(apk_name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.apk", apk_name):
+              raise SystemExit("version.json must identify the attached APK by its filename.")
+          if not isinstance(sha256, str) or not re.fullmatch(r"[A-Fa-f0-9]{64}", sha256):
+              raise SystemExit("version.json must contain the APK's SHA-256 digest.")
+
+          apk = download_asset(apk_name, 96 * 1024 * 1024)
+          if hashlib.sha256(apk).hexdigest() != sha256.lower():
+              raise SystemExit("The attached APK's SHA-256 differs from version.json.")
+
+          build_tools = Path(os.environ["ANDROID_HOME"], "build-tools")
+          aapt = max(
+              build_tools.glob("*/aapt2"),
+              key=lambda tool: tuple(map(int, re.findall(r"[0-9]+", tool.parent.name))),
+              default=None,
+          )
+          if aapt is None or not aapt.with_name("apksigner").is_file():
+              raise SystemExit("Android Build Tools are missing from the GitHub runner.")
+          with tempfile.TemporaryDirectory() as directory:
+              apk_file = Path(directory, "release.apk")
+              apk_file.write_bytes(apk)
+              signing = subprocess.run(
+                  [aapt.with_name("apksigner"), "verify", apk_file],
+                  capture_output=True, timeout=30,
+              )
+              if signing.returncode != 0:
+                  raise SystemExit("The attached APK does not have a valid Android signature.")
+              badging = subprocess.run(
+                  [aapt, "dump", "badging", apk_file],
+                  capture_output=True, check=True, text=True, timeout=30,
+              ).stdout
+          package = re.search(
+              r"^package: name='([^']+)' versionCode='([^']+)' versionName='([^']*)'",
+              badging, re.MULTILINE,
+          )
+          if package is None or package.groups() != ("fm.aiu.radio", str(version_code), version_name):
+              raise SystemExit("The APK package and versions must match AIU Radio and version.json.")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"version_code={version_code}", file=output)
+          print(f"Verified AIU Radio APK, version code {version_code}.")
+          PY
+
+      - name: Notify via Firebase or validate without delivery
+        env:
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+          ANDROID_VERSION_CODE: ${{ steps.release.outputs.version_code }}
+        run: |
+          python3 - <<'PY'
+          import http.client
+          import json
+          import os
+          import subprocess
+          import tempfile
+
+          project = "aiu-app-c9305"
+          topic = "aiu-radio-app-updates"
+          secret = os.environ.pop("FIREBASE_SERVICE_ACCOUNT_JSON", "")
+          if not secret:
+              raise SystemExit("Add the FIREBASE_SERVICE_ACCOUNT_JSON repository secret in GitHub.")
+          credentials = json.loads(secret)
+          if credentials.get("type") != "service_account" or credentials.get("project_id") != project:
+              raise SystemExit(f"Use a service account key from the {project} project.")
+
+          with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as key:
+              key.write(secret)
+              key.flush()
+              token_result = subprocess.run(
+                  ["gcloud", "auth", "application-default", "print-access-token",
+                   "--scopes=https://www.googleapis.com/auth/firebase.messaging"],
+                  env={**os.environ, "GOOGLE_APPLICATION_CREDENTIALS": key.name},
+                  capture_output=True, text=True, timeout=45,
+              )
+          if token_result.returncode != 0 or not token_result.stdout.strip():
+              raise SystemExit("Google Cloud could not authenticate. Check the service account key.")
+
+          validate_only = os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch"
+          version_code = "1" if validate_only else os.environ["ANDROID_VERSION_CODE"]
+          body = json.dumps({
+              "validate_only": validate_only,
+              "message": {
+                  "topic": topic,
+                  "data": {"type": "app_update", "versionCode": version_code},
+                  "android": {"priority": "NORMAL", "ttl": "259200s", "collapse_key": topic},
+              },
+          })
+          connection = http.client.HTTPSConnection("fcm.googleapis.com", timeout=30)
+          try:
+              connection.request("POST", f"/v1/projects/{project}/messages:send", body, {
+                  "Authorization": f"Bearer {token_result.stdout.strip()}",
+                  "Content-Type": "application/json",
+              })
+              response = connection.getresponse()
+              if response.status != 200:
+                  raise SystemExit(
+                      f"Firebase returned HTTP {response.status}. "
+                      "Check that the FCM API is enabled and the account has Firebase Cloud Messaging API Admin."
+                  )
+              receipt = json.load(response)
+          finally:
+              connection.close()
+
+          if validate_only:
+              print("Firebase validated the update message without delivery.")
+          elif receipt.get("name"):
+              print("Firebase accepted the update alert.")
+          else:
+              raise SystemExit("Firebase did not return an alert message ID.")
+          PY
