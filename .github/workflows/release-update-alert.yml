@@ -60,44 +60,31 @@ jobs:
           if event["release"]["id"] != release["id"]:
               raise SystemExit("Only the release marked latest in GitHub can trigger an alert.")
 
-          def download_asset(name, max_size):
-              assets = [
-                  asset for asset in release["assets"]
-                  if asset["name"] == name and asset["state"] == "uploaded"
-              ]
-              if len(assets) != 1:
-                  raise SystemExit(f"Attach one {name} asset to the release before publishing.")
-              asset = assets[0]
-              size = asset["size"]
-              tag = quote(release["tag_name"], safe="")
-              url = f"https://github.com/{repository}/releases/download/{tag}/{quote(name, safe='')}"
-              if asset["browser_download_url"] != url or not 1 <= size <= max_size:
-                  raise SystemExit(f"The release asset {name} has an invalid URL or size.")
-              with urlopen(url, timeout=60) as response:
-                  content = response.read(size + 1)
-              if len(content) != size:
-                  raise SystemExit(f"The downloaded size of {name} differs from GitHub's asset size.")
-              return content
+          tag = release["tag_name"]
+          if not re.fullmatch(r"[vV]?[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}", tag):
+              raise SystemExit("Tag the release with the APK version name, such as v0.8.0.")
+          version_name = tag.lstrip("vV")
 
-          version = json.loads(download_asset("version.json", 8192))
-          if not isinstance(version, dict):
-              raise SystemExit("version.json must contain a JSON object.")
-          version_code = version.get("versionCode")
-          version_name = version.get("versionName")
-          apk_name = version.get("apkName")
-          sha256 = version.get("sha256")
-          if type(version_code) is not int or not 1 <= version_code <= 2147483647:
-              raise SystemExit("version.json must contain a positive integer Android versionCode.")
-          if not isinstance(version_name, str) or not version_name.strip() or len(version_name) > 64:
-              raise SystemExit("version.json must contain a valid Android versionName.")
-          if not isinstance(apk_name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.apk", apk_name):
-              raise SystemExit("version.json must identify the attached APK by its filename.")
-          if not isinstance(sha256, str) or not re.fullmatch(r"[A-Fa-f0-9]{64}", sha256):
-              raise SystemExit("version.json must contain the APK's SHA-256 digest.")
+          assets = [
+              asset for asset in release["assets"]
+              if asset["name"].lower().endswith(".apk") and asset["state"] == "uploaded"
+          ]
+          if len(assets) != 1:
+              raise SystemExit("Attach exactly one APK to the release before publishing.")
+          asset = assets[0]
+          name = asset["name"]
+          size = asset["size"]
+          url = f"https://github.com/{repository}/releases/download/{tag}/{quote(name, safe='')}"
+          if asset["browser_download_url"] != url or not 1 <= size <= 96 * 1024 * 1024:
+              raise SystemExit("The release APK has an invalid download URL or size.")
+          digest = re.fullmatch(r"sha256:([A-Fa-f0-9]{64})", asset.get("digest") or "")
+          if digest is None:
+              raise SystemExit("GitHub did not provide a SHA-256 digest for the attached APK.")
 
-          apk = download_asset(apk_name, 96 * 1024 * 1024)
-          if hashlib.sha256(apk).hexdigest() != sha256.lower():
-              raise SystemExit("The attached APK's SHA-256 differs from version.json.")
+          with urlopen(url, timeout=60) as response:
+              apk = response.read(size + 1)
+          if len(apk) != size or hashlib.sha256(apk).hexdigest() != digest.group(1).lower():
+              raise SystemExit("The attached APK's size or SHA-256 differs from GitHub's asset metadata.")
 
           build_tools = Path(os.environ["ANDROID_HOME"], "build-tools")
           aapt = max(
@@ -121,20 +108,27 @@ jobs:
                   capture_output=True, check=True, text=True, timeout=30,
               ).stdout
           package = re.search(
-              r"^package: name='([^']+)' versionCode='([^']+)' versionName='([^']*)'",
+              r"^package: name='([^']+)' versionCode='([0-9]{1,10})' versionName='([^']*)'",
               badging, re.MULTILINE,
           )
-          if package is None or package.groups() != ("fm.aiu.radio", str(version_code), version_name):
-              raise SystemExit("The APK package and versions must match AIU Radio and version.json.")
+          if package is None or package.group(1) != "fm.aiu.radio":
+              raise SystemExit("The attached APK must have the AIU Radio package fm.aiu.radio.")
+          version_code = int(package.group(2))
+          if not 1 <= version_code <= 2147483647:
+              raise SystemExit("The attached APK must have a positive Android versionCode.")
+          if package.group(3) != version_name:
+              raise SystemExit("The GitHub tag and the APK's Android versionName must match.")
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               print(f"version_code={version_code}", file=output)
-          print(f"Verified AIU Radio APK, version code {version_code}.")
+              print(f"version_name={version_name}", file=output)
+          print(f"Verified AIU Radio APK {version_name}, version code {version_code}.")
           PY
 
       - name: Notify via Firebase or validate without delivery
         env:
           FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
+          ANDROID_VERSION_NAME: ${{ steps.release.outputs.version_name }}
           ANDROID_VERSION_CODE: ${{ steps.release.outputs.version_code }}
         run: |
           python3 - <<'PY'
@@ -167,11 +161,14 @@ jobs:
 
           validate_only = os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch"
           version_code = "1" if validate_only else os.environ["ANDROID_VERSION_CODE"]
+          version_name = "0.0.1" if validate_only else os.environ["ANDROID_VERSION_NAME"]
           body = json.dumps({
               "validate_only": validate_only,
               "message": {
                   "topic": topic,
-                  "data": {"type": "app_update", "versionCode": version_code},
+                  "data": {
+                      "type": "app_update", "versionCode": version_code, "versionName": version_name,
+                  },
                   "android": {"priority": "NORMAL", "ttl": "259200s", "collapse_key": topic},
               },
           })
