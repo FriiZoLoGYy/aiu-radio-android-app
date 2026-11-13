@@ -1,10 +1,16 @@
 name: Android update alerts
-run-name: ${{ github.event_name == 'workflow_dispatch' && 'Validate Firebase without delivery' || 'Send Android update alert' }}
+run-name: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag == '' && 'Validate Firebase without delivery' || 'Send Android update alert' }}
 
 on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Exact latest release tag to send an alert for. Leave blank to test Firebase.'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -21,15 +27,16 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     concurrency:
-      group: aiu-radio-update-alert-${{ github.event_name }}
+      group: aiu-radio-update-alert-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag == '' && 'validate' || 'send' }}
       cancel-in-progress: false
 
     steps:
-      - name: Verify the published release and APK
+      - name: Verify the published release and Universal APK
         id: release
-        if: github.event_name == 'release'
+        if: github.event_name == 'release' || inputs.release_tag != ''
         env:
           GH_TOKEN: ${{ github.token }}
+          REQUESTED_RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           python3 - <<'PY'
           import hashlib
@@ -56,9 +63,12 @@ jobs:
 
           if release["draft"] or release["prerelease"] or not release["published_at"]:
               raise SystemExit("GitHub must have a published stable release.")
-          event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
-          if event["release"]["id"] != release["id"]:
-              raise SystemExit("Only the release marked latest in GitHub can trigger an alert.")
+          if os.environ["GITHUB_EVENT_NAME"] == "release":
+              event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
+              if event["release"]["id"] != release["id"]:
+                  raise SystemExit("Only the release marked latest in GitHub can trigger an alert.")
+          elif os.environ["REQUESTED_RELEASE_TAG"] != release["tag_name"]:
+              raise SystemExit("Enter the exact tag of the latest stable release.")
 
           tag = release["tag_name"]
           if not re.fullmatch(r"[vV]?[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}", tag):
@@ -69,9 +79,21 @@ jobs:
               asset for asset in release["assets"]
               if asset["name"].lower().endswith(".apk") and asset["state"] == "uploaded"
           ]
-          if len(assets) != 1:
-              raise SystemExit("Attach exactly one APK to the release before publishing.")
-          asset = assets[0]
+          stem = f"AIU-Radio-v{version_name}"
+          universal = f"{stem}-universal.apk"
+          expected = {
+              universal,
+              f"{stem}-arm64-v8a.apk",
+              f"{stem}-armeabi-v7a.apk",
+              f"{stem}-x86_64.apk",
+          }
+          names = {asset["name"] for asset in assets}
+          if len(assets) == 1 and names == {f"{stem}.apk"}:
+              asset = assets[0]
+          elif len(assets) == len(expected) and names == expected:
+              asset = next(asset for asset in assets if asset["name"] == universal)
+          else:
+              raise SystemExit("Attach all four versioned Android APKs, including Universal, or one legacy unqualified APK.")
           name = asset["name"]
           size = asset["size"]
           url = f"https://github.com/{repository}/releases/download/{tag}/{quote(name, safe='')}"
@@ -122,7 +144,7 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               print(f"version_code={version_code}", file=output)
               print(f"version_name={version_name}", file=output)
-          print(f"Verified AIU Radio APK {version_name}, version code {version_code}.")
+          print(f"Verified {name}, version code {version_code}.")
           PY
 
       - name: Notify via Firebase or validate without delivery
@@ -130,6 +152,7 @@ jobs:
           FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_JSON }}
           ANDROID_VERSION_NAME: ${{ steps.release.outputs.version_name }}
           ANDROID_VERSION_CODE: ${{ steps.release.outputs.version_code }}
+          REQUESTED_RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           python3 - <<'PY'
           import http.client
@@ -159,9 +182,14 @@ jobs:
           if token_result.returncode != 0 or not token_result.stdout.strip():
               raise SystemExit("Google Cloud could not authenticate. Check the service account key.")
 
-          validate_only = os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch"
+          validate_only = (
+              os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch"
+              and not os.environ["REQUESTED_RELEASE_TAG"]
+          )
           version_code = "1" if validate_only else os.environ["ANDROID_VERSION_CODE"]
           version_name = "0.0.1" if validate_only else os.environ["ANDROID_VERSION_NAME"]
+          if not version_code or not version_name:
+              raise SystemExit("The release APK must be verified before sending an update alert.")
           body = json.dumps({
               "validate_only": validate_only,
               "message": {
